@@ -1,0 +1,96 @@
+## ===== Manual harmonisation + MR (Wald & IVW), no TwoSampleMR dependence =====
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(purrr)
+})
+
+EXP_PATH <- "/Users/ciara/Downloads/PA_exposure_TwoSampleMR_ready.csv"
+OUT_PATH <- "/Users/ciara/Downloads/mQTL_outcome_TwoSampleMR_ready.csv"
+OUTDIR   <- "/Users/ciara/Downloads"
+
+HARM_FILE <- file.path(OUTDIR, "PA_to_CpG_harmonised_MANUAL.csv")
+MR_FILE   <- file.path(OUTDIR, "MR_results_MANUAL.csv")
+
+# 0) Load (already in TSMR-like format)
+exp <- readr::read_delim(EXP_PATH, delim = if (grepl("\t", readLines(EXP_PATH,1))) "\t" else ",", show_col_types = FALSE)
+out <- readr::read_delim(OUT_PATH, delim = if (grepl("\t", readLines(OUT_PATH,1))) "\t" else ",", show_col_types = FALSE)
+
+# sanity checks on columns we will use
+need_exp <- c("SNP","beta.exposure","se.exposure","effect_allele.exposure","other_allele.exposure")
+need_out <- c("SNP","beta.outcome","se.outcome","effect_allele.outcome","other_allele.outcome","id.outcome")
+stopifnot(all(need_exp %in% names(exp)))
+stopifnot(all(need_out %in% names(out)))
+
+# 1) Inner join by SNP
+j <- inner_join(
+  exp %>% select(all_of(need_exp)),
+  out %>% select(all_of(need_out)),
+  by = "SNP"
+)
+
+if (!nrow(j)) stop("No overlapping SNPs between exposure and outcome.")
+
+# 2) Drop ambiguous palindromic SNPs (A/T or C/G) when we don't have reliable EAF
+is_pal <- function(a1,a2) {
+  a1 <- toupper(a1); a2 <- toupper(a2)
+  (a1=="A" & a2=="T") | (a1=="T" & a2=="A") | (a1=="C" & a2=="G") | (a1=="G" & a2=="C")
+}
+j <- j %>%
+  mutate(palin = is_pal(effect_allele.exposure, other_allele.exposure)) %>%
+  filter(!palin) %>% select(-palin)
+
+if (!nrow(j)) stop("All overlapping SNPs were palindromic and removed (no EAF available).")
+
+# 3) Harmonise alleles manually (flip outcome beta if needed)
+j2 <- j %>%
+  mutate(
+    alleles_match      = (effect_allele.outcome == effect_allele.exposure &
+                          other_allele.outcome  == other_allele.exposure),
+    alleles_swapped    = (effect_allele.outcome == other_allele.exposure &
+                          other_allele.outcome  == effect_allele.exposure),
+    keep_row           = alleles_match | alleles_swapped,
+    beta.outcome.align = ifelse(alleles_swapped, -beta.outcome, beta.outcome),
+    se.outcome.align   = se.outcome
+  ) %>%
+  filter(keep_row) %>%
+  select(-keep_row)
+
+if (!nrow(j2)) stop("After allele checks, no rows remain to analyse.")
+
+# 4) Compute Wald ratios per SNP and per CpG
+# Wald ratio for SNP i: r_i = beta_outcome.align / beta_exposure
+# SE via delta method: se(r_i) = sqrt( (se_out^2 / beta_exp^2) + (beta_out^2 * se_exp^2 / beta_exp^4) )
+ratios <- j2 %>%
+  mutate(
+    ratio      = beta.outcome.align / beta.exposure,
+    se_ratio   = sqrt( (se.outcome.align^2 / (beta.exposure^2)) +
+                       ((beta.outcome.align^2) * (se.exposure^2) / (beta.exposure^4)) ),
+    w_ratio    = 1 / (se_ratio^2),
+    id.outcome = as.character(id.outcome)
+  )
+
+# 5) Per-CpG MR: Wald if 1 SNP, FE-IVW if ≥2
+mr_per_cpg <- ratios %>%
+  group_by(id.outcome) %>%
+  summarise(
+    nsnp      = n(),
+    method    = ifelse(nsnp==1, "Wald ratio", "IVW (fixed effect)"),
+    b         = if (nsnp==1) ratio[1] else sum(w_ratio * ratio) / sum(w_ratio),
+    se        = if (nsnp==1) se_ratio[1] else sqrt(1 / sum(w_ratio)),
+    z         = b / se,
+    pval      = 2 * pnorm(-abs(z)),
+    .groups   = "drop"
+  ) %>%
+  arrange(pval)
+
+# 6) Write outputs
+readr::write_csv(j2, HARM_FILE)
+readr::write_csv(mr_per_cpg, MR_FILE)
+
+cat("Harmonised rows ->", HARM_FILE, " (", nrow(j2), " rows )\n", sep="")
+cat("MR results     ->", MR_FILE,   " (", nrow(mr_per_cpg), " CpGs )\n", sep="")
+
+# 7) Console preview
+print(mr_per_cpg, n = nrow(mr_per_cpg))
