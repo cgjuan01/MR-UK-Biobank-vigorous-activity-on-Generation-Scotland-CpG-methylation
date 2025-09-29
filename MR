@@ -1,0 +1,190 @@
+#!/usr/bin/env Rscript
+# manual_mr_harmonise.R
+# Manual allele harmonisation + per-outcome MR (Wald & fixed-effect IVW)
+# No TwoSampleMR dependency. CLI-friendly. Works with TwoSampleMR-like CSV/TSV inputs.
+#
+# Usage:
+#   Rscript manual_mr_harmonise.R \
+#     --exposure path/to/exposure.csv \
+#     --outcome  path/to/outcome.csv \
+#     --outdir   path/to/outdir \
+#     --keep-pal-with-eaf TRUE \
+#     --eaf-thresh 0.05
+#
+# Exposure required cols:
+#   SNP, beta.exposure, se.exposure, effect_allele.exposure, other_allele.exposure
+#   (optional) eaf.exposure
+# Outcome required cols:
+#   SNP, beta.outcome, se.outcome, effect_allele.outcome, other_allele.outcome, id.outcome
+#   (optional) eaf.outcome
+#
+# Outputs (in --outdir):
+#   harmonised:  <basename>_harmonised.csv
+#   mr results:  <basename>_mr.csv
+#   log:         <basename>_log.txt
+#
+# Exit codes: 0 = success; non-zero on error.
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(stringr)
+  library(purrr)
+  library(optparse)
+})
+
+# ---------- CLI ----------
+opt <- OptionParser(
+  usage = "%prog --exposure EXP --outcome OUT --outdir OUTDIR [options]",
+  option_list = list(
+    make_option(c("-e","--exposure"), type="character", help="Exposure CSV/TSV (TwoSampleMR-like) [required]"),
+    make_option(c("-o","--outcome"),  type="character", help="Outcome CSV/TSV (TwoSampleMR-like) [required]"),
+    make_option(c("-d","--outdir"),   type="character", default=".", help="Output directory [default: %default]"),
+    make_option(c("--keep-pal-with-eaf"), type="logical", default=FALSE,
+                help="Keep palindromic SNPs if EAF available and away from 0.5 [default: %default]"),
+    make_option(c("--eaf-thresh"), type="double", default=0.05,
+                help="Absolute distance from 0.5 required for palindromic SNP retention [default: %default]"),
+    make_option(c("--basename"), type="character", default=NULL,
+                help="Base name for outputs (defaults to exposure filename stem)"),
+    make_option(c("--min-snps"), type="integer", default=1,
+                help="Minimum SNPs required per id.outcome to report MR [default: %default]")
+  )
+) |> parse_args()
+
+if (is.null(opt$exposure) || is.null(opt$outcome)) {
+  print_help(OptionParser(option_list = opt$options))
+  stop("Please provide --exposure and --outcome paths.", call. = FALSE)
+}
+
+dir.create(opt$outdir, showWarnings = FALSE, recursive = TRUE)
+
+# ---------- Helpers ----------
+read_any <- function(path) {
+  delim <- if (grepl("\t", readLines(path, n = 1))) "\t" else ","
+  readr::read_delim(path, delim = delim, show_col_types = FALSE, progress = FALSE)
+}
+
+is_pal <- function(a1, a2) {
+  a1 <- toupper(a1); a2 <- toupper(a2)
+  (a1=="A" & a2=="T") | (a1=="T" & a2=="A") | (a1=="C" & a2=="G") | (a1=="G" & a2=="C")
+}
+
+# ---------- Load ----------
+exp <- read_any(opt$exposure)
+out <- read_any(opt$outcome)
+
+need_exp <- c("SNP","beta.exposure","se.exposure","effect_allele.exposure","other_allele.exposure")
+need_out <- c("SNP","beta.outcome","se.outcome","effect_allele.outcome","other_allele.outcome","id.outcome")
+if (!all(need_exp %in% names(exp))) stop("Exposure missing columns: ", paste(setdiff(need_exp, names(exp)), collapse=", "))
+if (!all(need_out %in% names(out))) stop("Outcome missing columns: ",  paste(setdiff(need_out, names(out)), collapse=", "))
+
+# ---------- Join by SNP ----------
+j <- inner_join(
+  exp |> select(any_of(c(need_exp,"eaf.exposure"))),
+  out |> select(any_of(c(need_out,"eaf.outcome"))),
+  by = "SNP"
+)
+
+if (!nrow(j)) stop("No overlapping SNPs between exposure and outcome.")
+
+# ---------- Palindrome filtering (with optional EAF rescue) ----------
+j <- j |>
+  mutate(
+    pal = is_pal(effect_allele.exposure, other_allele.exposure),
+    have_eaf = ("eaf.exposure" %in% names(j)) & ("eaf.outcome" %in% names(j)) &
+               !is.na(eaf.exposure) & !is.na(eaf.outcome),
+    eaf_ok = have_eaf & (abs(eaf.exposure - 0.5) >= opt$eaf_thresh) & (abs(eaf.outcome - 0.5) >= opt$eaf_thresh)
+  )
+
+if (opt$`keep-pal-with-eaf`) {
+  j <- j |> filter(!pal | eaf_ok)
+} else {
+  j <- j |> filter(!pal)
+}
+
+if (!nrow(j)) stop("All overlapping SNPs were removed by palindrome/EAF filter.")
+
+# ---------- Harmonise ----------
+j2 <- j |>
+  mutate(
+    alleles_match   = (effect_allele.outcome == effect_allele.exposure &
+                       other_allele.outcome  == other_allele.exposure),
+    alleles_swapped = (effect_allele.outcome == other_allele.exposure &
+                       other_allele.outcome  == effect_allele.exposure),
+    keep_row        = alleles_match | alleles_swapped,
+    beta.outcome.align = ifelse(alleles_swapped, -beta.outcome, beta.outcome),
+    se.outcome.align   = se.outcome
+  ) |>
+  filter(keep_row) |>
+  select(-keep_row)
+
+if (!nrow(j2)) stop("After allele alignment checks, no rows remain.")
+
+# ---------- Per-SNP ratios ----------
+ratios <- j2 |>
+  mutate(
+    ratio    = beta.outcome.align / beta.exposure,
+    se_ratio = sqrt( (se.outcome.align^2 / (beta.exposure^2)) +
+                     ((beta.outcome.align^2) * (se.exposure^2) / (beta.exposure^4)) ),
+    w_ratio  = 1 / (se_ratio^2),
+    id.outcome = as.character(id.outcome)
+  )
+
+# ---------- Per-outcome MR (Wald or IVW FE) + heterogeneity ----------
+mr <- ratios |>
+  group_by(id.outcome) |>
+  summarise(
+    nsnp   = n(),
+    method = ifelse(nsnp==1, "Wald ratio", "IVW (fixed effect)"),
+    b      = if (nsnp==1) ratio[1] else sum(w_ratio * ratio) / sum(w_ratio),
+    se     = if (nsnp==1) se_ratio[1] else sqrt(1 / sum(w_ratio)),
+    z      = b / se,
+    pval   = 2 * pnorm(-abs(z)),
+    # Cochran's Q for nsnp>=2; NA otherwise
+    Q      = if (nsnp>=2) sum(w_ratio * (ratio - (sum(w_ratio * ratio) / sum(w_ratio)))^2) else NA_real_,
+    Q_df   = if (nsnp>=2) nsnp - 1 else NA_integer_,
+    Q_p    = if (nsnp>=2) pchisq(Q, df = Q_df, lower.tail = FALSE) else NA_real_,
+    .groups = "drop"
+  ) |>
+  filter(nsnp >= opt$`min-snps`) |>
+  arrange(pval)
+
+# ---------- Write outputs ----------
+basename <- if (!is.null(opt$basename)) opt$basename else {
+  x <- basename(opt$exposure)
+  sub("\\.(csv|tsv|txt|gz)$","",x, ignore.case = TRUE)
+}
+harm_path <- file.path(opt$outdir, paste0(basename, "_harmonised.csv"))
+mr_path   <- file.path(opt$outdir, paste0(basename, "_mr.csv"))
+log_path  <- file.path(opt$outdir, paste0(basename, "_log.txt"))
+
+write_csv(
+  j2 |>
+    select(SNP,
+           effect_allele.exposure, other_allele.exposure,
+           effect_allele.outcome,  other_allele.outcome,
+           beta.exposure, se.exposure,
+           beta.outcome,  se.outcome,
+           beta.outcome.align, se.outcome.align,
+           ratio, se_ratio, w_ratio, id.outcome,
+           pal, have_eaf, eaf_ok, alleles_match, alleles_swapped),
+  harm_path
+)
+write_csv(mr, mr_path)
+
+cat(sprintf("Harmonised rows -> %s (%d rows)\n", harm_path, nrow(j2)))
+cat(sprintf("MR results     -> %s (%d outcomes)\n", mr_path, nrow(mr)))
+
+# also save a brief log
+log_lines <- c(
+  paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "] manual_mr_harmonise.R"),
+  paste0("Exposure: ", normalizePath(opt$exposure)),
+  paste0("Outcome : ", normalizePath(opt$outcome)),
+  paste0("Outdir  : ", normalizePath(opt$outdir)),
+  paste0("Keep palindromic with EAF: ", opt$`keep-pal-with-eaf`),
+  paste0("EAF threshold: ", opt$`eaf-thresh`),
+  paste0("Min SNPs per outcome: ", opt$`min-snps`),
+  paste0("Harmonised rows: ", nrow(j2)),
+  paste0("MR outcomes: ", nrow(mr))
+)
+writeLines(log_lines, con = log_path)
